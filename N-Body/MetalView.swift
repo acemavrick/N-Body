@@ -23,7 +23,6 @@ struct MetalView: NSViewRepresentable {
         let mtkView = MTKView()
         mtkView.device = self.mtlDevice
         mtkView.delegate = context.coordinator
-        mtkView.clearColor = MTLClearColorMake(0, 0.5, 0.1, 1.0)
         mtkView.colorPixelFormat = .bgra8Unorm
         mtkView.enableSetNeedsDisplay = false
         return mtkView
