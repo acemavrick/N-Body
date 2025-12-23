@@ -17,9 +17,12 @@ class Renderer: NSObject, MTKViewDelegate {
     var sharedEvent: MTLSharedEvent!
     var lastFrameTime: CFAbsoluteTime!
     var frameNumber: UInt64 = 0
+    var trailTexture: MTLTexture!
     
     var computePipeline: MTLComputePipelineState!
+    var fadePipeline: MTLRenderPipelineState!
     var renderPipelineState: MTLRenderPipelineState!
+    var copyPipeline: MTLRenderPipelineState!
 
     var nBodyUniformsBuffer: MTLBuffer!
     var cameraUniformsBuffer: MTLBuffer!
@@ -32,7 +35,7 @@ class Renderer: NSObject, MTKViewDelegate {
     var camUniforms: CameraUniforms!
     var nbUniforms: NBodyUniforms!
     
-    let particleCount: Int = 1_000
+    let particleCount: Int = 20_000
     
     init(device mtlDev: MTLDevice) {
         super.init()
@@ -65,7 +68,7 @@ class Renderer: NSObject, MTKViewDelegate {
         self.camUniforms = CameraUniforms(
             center: SIMD2<Float>(0.0, 0.0),
             viewportSize: SIMD2<Float>(0.0, 0.0),
-            zoom: 4.0,
+            zoom: 1.0,
             pad0: 0.0,
             pad1: 0.0,
             pad2: 0.0
@@ -100,6 +103,32 @@ class Renderer: NSObject, MTKViewDelegate {
         fragmentFuncDesc.library = library
         fragmentFuncDesc.name = "nbody_fragment"
         
+        let fadeVertexDesc = MTL4LibraryFunctionDescriptor()
+        fadeVertexDesc.library = library
+        fadeVertexDesc.name = "fade_vertex"
+        
+        let fadeFragmentDesc = MTL4LibraryFunctionDescriptor()
+        fadeFragmentDesc.library = library
+        fadeFragmentDesc.name = "fade_fragment"
+        
+        let copyVertDesc = MTL4LibraryFunctionDescriptor()
+        copyVertDesc.library = library
+        copyVertDesc.name = "copy_vertex"
+        
+        let copyFragDesc = MTL4LibraryFunctionDescriptor()
+        copyFragDesc.library = library
+        copyFragDesc.name = "copy_fragment"
+        
+        let fadeRPDesc = MTL4RenderPipelineDescriptor()
+        fadeRPDesc.vertexFunctionDescriptor = fadeVertexDesc
+        fadeRPDesc.fragmentFunctionDescriptor = fadeFragmentDesc
+        fadeRPDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        fadeRPDesc.colorAttachments[0].blendingState = .enabled
+        fadeRPDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+        fadeRPDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+        fadeRPDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        fadeRPDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+
         let compilerDescriptor = MTL4CompilerDescriptor()
         let compiler = try! self.device.makeCompiler(descriptor: compilerDescriptor)
         
@@ -112,10 +141,22 @@ class Renderer: NSObject, MTKViewDelegate {
         rpDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
         rpDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
         rpDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
-
+        
+        let copyRPDesc = MTL4RenderPipelineDescriptor()
+        copyRPDesc.fragmentFunctionDescriptor = copyFragDesc
+        copyRPDesc.vertexFunctionDescriptor = copyVertDesc
+        copyRPDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
+        
+        self.copyPipeline = try! compiler.makeRenderPipelineState(
+            descriptor: copyRPDesc
+        )
         
         self.computePipeline = try! compiler.makeComputePipelineState(
             descriptor: computeFuncDesc
+        )
+        
+        self.fadePipeline = try! compiler.makeRenderPipelineState(
+            descriptor: fadeRPDesc
         )
         
         self.renderPipelineState = try! compiler.makeRenderPipelineState(
@@ -123,9 +164,11 @@ class Renderer: NSObject, MTKViewDelegate {
         )
         
         let argTableDesc = MTL4ArgumentTableDescriptor()
-        argTableDesc.maxBufferBindCount = 7
+        argTableDesc.maxBufferBindCount = 8
+        argTableDesc.maxTextureBindCount = 1
         self.argumentTable = try! device.makeArgumentTable(descriptor: argTableDesc)
-
+        
+        createTrailTexture(size: CGSize(width:1, height:1))
         
         let residencyDesc = MTLResidencySetDescriptor()
         self.residencySet = try! device.makeResidencySet(descriptor: residencyDesc)
@@ -136,11 +179,25 @@ class Renderer: NSObject, MTKViewDelegate {
         self.residencySet.addAllocation(self.massesBuffer)
         self.residencySet.addAllocation(self.nBodyUniformsBuffer)
         self.residencySet.addAllocation(self.cameraUniformsBuffer)
+        self.residencySet.addAllocation(self.trailTexture!)
         self.residencySet.commit()
         self.cmdQ.addResidencySet(self.residencySet)
         
         initParticles()
         self.lastFrameTime = CFAbsoluteTimeGetCurrent()
+    }
+    
+    func createTrailTexture(size: CGSize) {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: Int(size.width),
+            height: Int(size.height),
+            mipmapped: false
+        )
+        descriptor.usage = [.renderTarget, .shaderRead]
+        descriptor.storageMode = .private
+        
+        self.trailTexture = device.makeTexture(descriptor: descriptor)
     }
     
     func initParticles() {
@@ -165,10 +222,10 @@ class Renderer: NSObject, MTKViewDelegate {
             positions[i] = SIMD2<Float>(cos(angle) * radius, sin(angle) * radius)
             
             // circular orbit velocity
-            let speed: Float = 1.0
+            let speed: Float = 8.4
             velocities[i] = SIMD2<Float>(-sin(angle) * speed, cos(angle) * speed)
             
-            masses[i] = 1.0
+            masses[i] = Float.random(in: 1.0...2.0)
         }
     }
     
@@ -186,22 +243,27 @@ class Renderer: NSObject, MTKViewDelegate {
     }
     
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        // pass
+        createTrailTexture(size: size)
     }
     
     func draw(in view: MTKView) {
-        guard let drawable = view.currentDrawable,
-              let renderPassDesc = view.currentMTL4RenderPassDescriptor
+        guard let drawable = view.currentDrawable
         else {
             return
         }
         
+        if  trailTexture == nil ||
+            trailTexture!.width != Int(view.drawableSize.width) ||
+            trailTexture.height != Int(view.drawableSize.height)
+        {
+            createTrailTexture(size: view.drawableSize)
+        }
         
         // calc detla time
         let now = CFAbsoluteTimeGetCurrent()
         var deltaTime = Float(now - self.lastFrameTime)
         self.lastFrameTime = now
-        deltaTime = min(deltaTime, 1.0/60.0) // clamp to prevent weird stuff
+        deltaTime = min(deltaTime, 1.0/30.0) // clamp to prevent weird stuff
         
         updateUniforms(deltaTime: deltaTime, viewSize: view.drawableSize)
         
@@ -237,9 +299,13 @@ class Renderer: NSObject, MTKViewDelegate {
         computeEncoder.endEncoding()
         
         // render
-        let renderPassEncoder = self.cmdBuffer.makeRenderCommandEncoder(descriptor: renderPassDesc)!
+        let trailPassDesc = MTL4RenderPassDescriptor()
+        trailPassDesc.colorAttachments[0].texture = trailTexture
+        trailPassDesc.colorAttachments[0].loadAction = frameNumber == 0 ? .clear : .load
+        trailPassDesc.colorAttachments[0].storeAction = .store
+        trailPassDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         
-        renderPassEncoder.setRenderPipelineState(self.renderPipelineState)
+        let renderPassEncoder = self.cmdBuffer.makeRenderCommandEncoder(descriptor: trailPassDesc)!
         
         var vp = MTLViewport()
         vp.originX = 0
@@ -250,11 +316,25 @@ class Renderer: NSObject, MTKViewDelegate {
         vp.zfar = 1
         renderPassEncoder.setViewport(vp)
         
+        renderPassEncoder.setRenderPipelineState(self.fadePipeline)
+        renderPassEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
+
         renderPassEncoder.setArgumentTable(self.argumentTable, stages: .vertex)
-        
+        renderPassEncoder.setRenderPipelineState(self.renderPipelineState)
+
         renderPassEncoder
             .drawPrimitives(primitiveType: .point, vertexStart: 0, vertexCount: particleCount)
         renderPassEncoder.endEncoding()
+        
+        let copyPassDesc = view.currentMTL4RenderPassDescriptor!
+        copyPassDesc.colorAttachments[0].loadAction = .dontCare
+        
+        let copyEncoder = cmdBuffer.makeRenderCommandEncoder(descriptor: copyPassDesc)!
+        copyEncoder.setRenderPipelineState(self.copyPipeline)
+        argumentTable.setTexture(trailTexture.gpuResourceID, index: 0)
+        copyEncoder.setArgumentTable(self.argumentTable, stages: .fragment)
+        copyEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
+        copyEncoder.endEncoding()
         
         self.cmdBuffer.endCommandBuffer()
         self.cmdQ.waitForDrawable(drawable)
