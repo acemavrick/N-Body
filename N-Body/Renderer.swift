@@ -17,6 +17,8 @@ class Renderer: NSObject, MTKViewDelegate {
     var sharedEvent: MTLSharedEvent!
     var vpSizeBuffer: MTLBuffer!
     var rpState: MTLRenderPipelineState!
+    var startTime: CFAbsoluteTime!
+    var timeBuffer: MTLBuffer!
     
     init(device mtlDev: MTLDevice) {
         super.init()
@@ -50,6 +52,20 @@ class Renderer: NSObject, MTKViewDelegate {
         self.rpState = try! compiler.makeRenderPipelineState(
             descriptor: rpDesc
         )
+        
+        let argTableDesc = MTL4ArgumentTableDescriptor()
+        argTableDesc.maxBufferBindCount = 1
+        self.argumentTable = try! device.makeArgumentTable(descriptor: argTableDesc)
+
+        self.startTime = CFAbsoluteTimeGetCurrent()
+        self.timeBuffer = device
+            .makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
+        
+        let residencyDesc = MTLResidencySetDescriptor()
+        self.residencySet = try! device.makeResidencySet(descriptor: residencyDesc)
+        self.residencySet.addAllocation(timeBuffer)
+        self.residencySet.commit()
+        self.cmdQ.addResidencySet(self.residencySet)
     }
     
     
@@ -59,6 +75,9 @@ class Renderer: NSObject, MTKViewDelegate {
     }
     
     func draw(in view: MTKView) {
+        let elapsed = Float(CFAbsoluteTimeGetCurrent() - startTime)
+        timeBuffer.contents().storeBytes(of: elapsed, as: Float.self)
+        
         guard let drawable = view.currentDrawable
         else {
             return
@@ -80,8 +99,9 @@ class Renderer: NSObject, MTKViewDelegate {
         
         renderPassEncoder.setRenderPipelineState(self.rpState)
         renderPassEncoder.setViewport(vp)
+        self.argumentTable.setAddress(timeBuffer.gpuAddress, index: 0)
+        renderPassEncoder.setArgumentTable(self.argumentTable, stages: .fragment)
         
-        // draw
         renderPassEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
         
         renderPassEncoder.endEncoding()
