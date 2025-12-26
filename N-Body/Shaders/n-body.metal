@@ -45,8 +45,8 @@ kernel void nbody_compute(
     
     acc *= uniforms.G;
     
-    vel += acc * uniforms.deltaTime;
-    pos += vel * uniforms.deltaTime;
+    vel += acc * uniforms.dt;
+    pos += vel * uniforms.dt;
     
     velocitiesOut[id] = vel;
     positionsOut[id] = pos;
@@ -72,15 +72,6 @@ vertex PointOut nbody_vertex(
     return out;
 }
 
-vertex float4 fade_vertex(uint vertexID [[vertex_id]]) {
-    float2 positions[3] = {
-        float2(-1, -1),
-        float2(3, -1),
-        float2(-1, 3)
-    };
-    return float4(positions[vertexID], 0.0, 1.0);
-}
-
 fragment float4 nbody_fragment(
     PointOut in [[stage_in]],
     float2 pointCoord [[point_coord]]
@@ -94,39 +85,3 @@ fragment float4 nbody_fragment(
     return float4(1.0, 0.9, 0.8, alpha) * float4(distLessThanOne);
 }
 
-fragment float4 fade_fragment() {
-    return float4(0.0, 0.0, 0.0, 0.08);
-}
-
-struct CopyOut {
-    float4 position [[position]];
-    float2 uv;
-};
-
-vertex CopyOut copy_vertex(uint vertexID [[vertex_id]]) {
-    // full-screen triangle
-    float2 positions[3] = {
-        float2(-1, -1),
-        float2(3, -1),
-        float2(-1, 3)
-    };
-    
-    float2 uvs[3] = {
-        float2(0, 1),
-        float2(2, 1),
-        float2(0, -1)
-    };
-    
-    CopyOut out;
-    out.position = float4(positions[vertexID], 0.0, 1.0);
-    out.uv = uvs[vertexID];
-    return out;
-}
-
-fragment float4 copy_fragment(
-    CopyOut in [[stage_in]],
-    texture2d<float> srcTexture [[texture(0)]]
-) {
-    constexpr sampler s(filter::nearest);
-    return srcTexture.sample(s, in.uv);
-}

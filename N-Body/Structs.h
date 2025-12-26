@@ -11,7 +11,7 @@
 #include <simd/simd.h>
 
 struct NBodyUniforms {
-    float deltaTime;
+    float dt;
     float G;
     float softening;
     uint32_t particleCount;

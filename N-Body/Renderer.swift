@@ -10,37 +10,37 @@ import MetalKit
 class Renderer: NSObject, MTKViewDelegate {
     var device: MTLDevice!
     var cmdQ: MTL4CommandQueue!
-    var cmdBuffer: MTL4CommandBuffer!
-    var cmdAllocator: MTL4CommandAllocator!
+    
     var argumentTable: MTL4ArgumentTable!
     var residencySet: MTLResidencySet!
-    var sharedEvent: MTLSharedEvent!
-    var lastFrameTime: CFAbsoluteTime!
-    var frameNumber: UInt64 = 0
-    var trailTexture: MTLTexture!
     
-    var computePipeline: MTLComputePipelineState!
-    var fadePipeline: MTLRenderPipelineState!
-    var renderPipelineState: MTLRenderPipelineState!
-    var copyPipeline: MTLRenderPipelineState!
+    let maxInFlight = 3
+    var sharedEvent: MTLSharedEvent!
+    
+    // triple buffered
+    var cmdBufferArr: [MTL4CommandBuffer] = []
+    var cmdAllocatorArr: [MTL4CommandAllocator] = []
+    var cameraUniformsBufferArr: [MTLBuffer] = []
+    var frameNumber: UInt64 = 0
 
     var nBodyUniformsBuffer: MTLBuffer!
-    var cameraUniformsBuffer: MTLBuffer!
+    var computePipelineState: MTLComputePipelineState!
+    var renderPipelineState: MTLRenderPipelineState!
+
     var positionsBufferA: MTLBuffer!
     var velocitiesBufferA: MTLBuffer!
     var positionsBufferB: MTLBuffer!
     var velocitiesBufferB: MTLBuffer!
     var massesBuffer: MTLBuffer!
-    var currentBuffer: Int = 0
-    var camUniforms: CameraUniforms!
+    var currentPhysicsBuffer: Int = 0
     var nbUniforms: NBodyUniforms!
+    var camUniforms: CameraUniforms!
     
-    let particleCount: Int = 20_000
+    let particleCount: Int = 40_000
     
     init(device mtlDev: MTLDevice) {
         super.init()
         self.device = mtlDev
-        
         
         let float2Size = MemoryLayout<SIMD2<Float>>.stride
         let floatSize = MemoryLayout<Float>.stride
@@ -49,22 +49,27 @@ class Renderer: NSObject, MTKViewDelegate {
         self.positionsBufferA = device.makeBuffer(
             length: float2Size * particleCount, options: .storageModeShared)!
         self.positionsBufferB = device.makeBuffer(
-            length: float2Size * particleCount, options: .storageModeShared)!
+            length: float2Size * particleCount, options: .storageModePrivate)!
         self.velocitiesBufferA = device.makeBuffer(
             length: float2Size * particleCount, options: .storageModeShared)!
         self.velocitiesBufferB = device.makeBuffer(
-            length: float2Size * particleCount, options: .storageModeShared)!
+            length: float2Size * particleCount, options: .storageModePrivate)!
         self.massesBuffer = device.makeBuffer(
             length: floatSize * particleCount, options: .storageModeShared)!
         self.nBodyUniformsBuffer = device.makeBuffer(
             length: MemoryLayout<NBodyUniforms>.stride,
             options: .storageModeShared
         )!
-        self.cameraUniformsBuffer = device.makeBuffer(
-            length: MemoryLayout<CameraUniforms>.stride,
-            options: .storageModeShared
-        )!
         
+        // make the triple buffer for camera uniforms
+        for _ in 0..<3 {
+            self.cameraUniformsBufferArr.append(device.makeBuffer(
+                length: MemoryLayout<CameraUniforms>.stride,
+                options: .storageModeShared
+            )!)
+        }
+        
+        // init the uniforms
         self.camUniforms = CameraUniforms(
             center: SIMD2<Float>(0.0, 0.0),
             viewportSize: SIMD2<Float>(0.0, 0.0),
@@ -73,23 +78,70 @@ class Renderer: NSObject, MTKViewDelegate {
             pad1: 0.0,
             pad2: 0.0
         )
+        
         self.nbUniforms = NBodyUniforms(
-            deltaTime: 0,
+            dt: 1.0/30.0,
             G: 10.0,
             softening: 1.0,
             particleCount: UInt32(self.particleCount)
         )
+        
+        self.nBodyUniformsBuffer.contents().copyMemory(
+            from: &self.nbUniforms, byteCount: MemoryLayout<NBodyUniforms>.stride)
+        
             
-        // create stuff
         self.cmdQ = self.device.makeMTL4CommandQueue()!
         
-        self.cmdBuffer = self.device.makeCommandBuffer()!
-        self.cmdAllocator = self.device.makeCommandAllocator()!
+        makePipelines()
+
+        // make triple cmd buffers
+        for _ in 0..<3 {
+            self.cmdBufferArr.append(self.device.makeCommandBuffer()!)
+            self.cmdAllocatorArr.append(self.device.makeCommandAllocator()!)
+        }
         
-        // create library and load shader functions
+        // make arg table
+        let argTableDesc = MTL4ArgumentTableDescriptor()
+        argTableDesc.maxBufferBindCount = 9
+        self.argumentTable = try! device.makeArgumentTable(descriptor: argTableDesc)
+        
+        makeResidencySet()
+        
+        initParticles()
+        
+        self.sharedEvent = device.makeSharedEvent()!
+    }
+    
+    // requires: device
+    // sets: residency set
+    func makeResidencySet() {
+        let residencyDesc = MTLResidencySetDescriptor()
+        self.residencySet = try! device.makeResidencySet(descriptor: residencyDesc)
+        
+        self.residencySet.addAllocation(self.positionsBufferA)
+        self.residencySet.addAllocation(self.positionsBufferB)
+        self.residencySet.addAllocation(self.velocitiesBufferA)
+        self.residencySet.addAllocation(self.velocitiesBufferB)
+        self.residencySet.addAllocation(self.massesBuffer)
+        self.residencySet.addAllocation(self.nBodyUniformsBuffer)
+        
+        // add triple buffered things
+        for i in 0..<3 {
+            self.residencySet.addAllocation(self.cameraUniformsBufferArr[i])
+        }
+        
+        self.residencySet.commit()
+        self.cmdQ.addResidencySet(self.residencySet)
+    }
+    
+    // requires: device
+    // sets: computePipelineState, renderPipelineState
+    func makePipelines() {
+        // create library, load shader functions, make pipelines
         let library = self.device.makeDefaultLibrary()!
         
         let computeFuncDesc = MTL4ComputePipelineDescriptor()
+        
         let computeFunc = MTL4LibraryFunctionDescriptor()
         computeFunc.library = library
         computeFunc.name = "nbody_compute"
@@ -102,32 +154,6 @@ class Renderer: NSObject, MTKViewDelegate {
         let fragmentFuncDesc = MTL4LibraryFunctionDescriptor()
         fragmentFuncDesc.library = library
         fragmentFuncDesc.name = "nbody_fragment"
-        
-        let fadeVertexDesc = MTL4LibraryFunctionDescriptor()
-        fadeVertexDesc.library = library
-        fadeVertexDesc.name = "fade_vertex"
-        
-        let fadeFragmentDesc = MTL4LibraryFunctionDescriptor()
-        fadeFragmentDesc.library = library
-        fadeFragmentDesc.name = "fade_fragment"
-        
-        let copyVertDesc = MTL4LibraryFunctionDescriptor()
-        copyVertDesc.library = library
-        copyVertDesc.name = "copy_vertex"
-        
-        let copyFragDesc = MTL4LibraryFunctionDescriptor()
-        copyFragDesc.library = library
-        copyFragDesc.name = "copy_fragment"
-        
-        let fadeRPDesc = MTL4RenderPipelineDescriptor()
-        fadeRPDesc.vertexFunctionDescriptor = fadeVertexDesc
-        fadeRPDesc.fragmentFunctionDescriptor = fadeFragmentDesc
-        fadeRPDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        fadeRPDesc.colorAttachments[0].blendingState = .enabled
-        fadeRPDesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
-        fadeRPDesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
-        fadeRPDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
-        fadeRPDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
 
         let compilerDescriptor = MTL4CompilerDescriptor()
         let compiler = try! self.device.makeCompiler(descriptor: compilerDescriptor)
@@ -142,64 +168,17 @@ class Renderer: NSObject, MTKViewDelegate {
         rpDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
         rpDesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
         
-        let copyRPDesc = MTL4RenderPipelineDescriptor()
-        copyRPDesc.fragmentFunctionDescriptor = copyFragDesc
-        copyRPDesc.vertexFunctionDescriptor = copyVertDesc
-        copyRPDesc.colorAttachments[0].pixelFormat = .bgra8Unorm
-        
-        self.copyPipeline = try! compiler.makeRenderPipelineState(
-            descriptor: copyRPDesc
-        )
-        
-        self.computePipeline = try! compiler.makeComputePipelineState(
+        self.computePipelineState = try! compiler.makeComputePipelineState(
             descriptor: computeFuncDesc
-        )
-        
-        self.fadePipeline = try! compiler.makeRenderPipelineState(
-            descriptor: fadeRPDesc
         )
         
         self.renderPipelineState = try! compiler.makeRenderPipelineState(
             descriptor: rpDesc
         )
-        
-        let argTableDesc = MTL4ArgumentTableDescriptor()
-        argTableDesc.maxBufferBindCount = 8
-        argTableDesc.maxTextureBindCount = 1
-        self.argumentTable = try! device.makeArgumentTable(descriptor: argTableDesc)
-        
-        createTrailTexture(size: CGSize(width:1, height:1))
-        
-        let residencyDesc = MTLResidencySetDescriptor()
-        self.residencySet = try! device.makeResidencySet(descriptor: residencyDesc)
-        self.residencySet.addAllocation(self.positionsBufferA)
-        self.residencySet.addAllocation(self.positionsBufferB)
-        self.residencySet.addAllocation(self.velocitiesBufferA)
-        self.residencySet.addAllocation(self.velocitiesBufferB)
-        self.residencySet.addAllocation(self.massesBuffer)
-        self.residencySet.addAllocation(self.nBodyUniformsBuffer)
-        self.residencySet.addAllocation(self.cameraUniformsBuffer)
-        self.residencySet.addAllocation(self.trailTexture!)
-        self.residencySet.commit()
-        self.cmdQ.addResidencySet(self.residencySet)
-        
-        initParticles()
-        self.lastFrameTime = CFAbsoluteTimeGetCurrent()
     }
     
-    func createTrailTexture(size: CGSize) {
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: Int(size.width),
-            height: Int(size.height),
-            mipmapped: false
-        )
-        descriptor.usage = [.renderTarget, .shaderRead]
-        descriptor.storageMode = .private
-        
-        self.trailTexture = device.makeTexture(descriptor: descriptor)
-    }
-    
+    // requires: positionsBufferA, velocitiesBufferA, massesBuffer
+    // sets: positionsBufferA, velocitiesBufferA, massesBuffer
     func initParticles() {
         let positions = positionsBufferA.contents().bindMemory(
             to: SIMD2<Float>.self,
@@ -214,72 +193,81 @@ class Renderer: NSObject, MTKViewDelegate {
             capacity: self.particleCount
         )
         
+        // avg mass since we do random from 1 to 2
+        var totalMass: Float = 0.0
+        
+        var radii: [Float] = []
+        var angles: [Float] = []
+        
+        let maxRadius: Float = 200.0
+        
         for i in 0..<self.particleCount {
             // in a disk (for now)
             let angle = Float.random(in: 0..<(2 * .pi))
-            let radius = sqrt(Float.random(in: 0..<1)) * 200
+            let radius = sqrt(Float.random(in: 0..<1)) * maxRadius
+            angles.append(angle)
+            radii.append(radius)
             
             positions[i] = SIMD2<Float>(cos(angle) * radius, sin(angle) * radius)
             
-            // circular orbit velocity
-            let speed: Float = 8.4
-            velocities[i] = SIMD2<Float>(-sin(angle) * speed, cos(angle) * speed)
-            
             masses[i] = Float.random(in: 1.0...2.0)
+            totalMass += masses[i]
+        }
+        
+        for i in 0..<self.particleCount {
+            let angle = angles[i]
+            let radius = radii[i]
+            
+            let enclosedMassEstimate = (radius * radius) / (maxRadius * maxRadius) * totalMass
+            
+            let speed: Float = sqrt(nbUniforms.G * enclosedMassEstimate / max(radius, 5.0))
+            
+            velocities[i] = SIMD2<Float>(-sin(angle) * speed, cos(angle) * speed)
         }
     }
     
-    func updateUniforms(deltaTime: Float, viewSize: CGSize) {
-        self.nbUniforms.deltaTime = deltaTime
-        nBodyUniformsBuffer.contents().copyMemory(
-            from: &nbUniforms,
-            byteCount: MemoryLayout<NBodyUniforms>.stride
-        )
-        self.camUniforms.viewportSize = SIMD2<Float>(Float(viewSize.width), Float(viewSize.height))
-        cameraUniformsBuffer.contents().copyMemory(
-            from: &camUniforms,
-            byteCount: MemoryLayout<CameraUniforms>.stride
-        )
-    }
-    
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
-        createTrailTexture(size: size)
+        // pass
     }
     
     func draw(in view: MTKView) {
-        guard let drawable = view.currentDrawable
+        guard let drawable = view.currentDrawable,
+              let rpDesc = view.currentMTL4RenderPassDescriptor
         else {
             return
         }
         
-        if  trailTexture == nil ||
-            trailTexture!.width != Int(view.drawableSize.width) ||
-            trailTexture.height != Int(view.drawableSize.height)
-        {
-            createTrailTexture(size: view.drawableSize)
+        let bufferIndex = Int(frameNumber % UInt64(maxInFlight))
+        
+        if (frameNumber >= maxInFlight) {
+            sharedEvent.wait(
+                untilSignaledValue: frameNumber - UInt64(maxInFlight),
+                timeoutMS: 1000
+            )
         }
         
-        // calc detla time
-        let now = CFAbsoluteTimeGetCurrent()
-        var deltaTime = Float(now - self.lastFrameTime)
-        self.lastFrameTime = now
-        deltaTime = min(deltaTime, 1.0/30.0) // clamp to prevent weird stuff
+        let currAllocator = self.cmdAllocatorArr[bufferIndex]
+        let currCmdBuffer = self.cmdBufferArr[bufferIndex]
+        let currCamBuffer = self.cameraUniformsBufferArr[bufferIndex]
         
-        updateUniforms(deltaTime: deltaTime, viewSize: view.drawableSize)
+        self.camUniforms.viewportSize = SIMD2<Float>(
+            Float(view.drawableSize.width), Float(view.drawableSize.height))
+        currCamBuffer.contents().copyMemory(from: &camUniforms,
+                                            byteCount: MemoryLayout<CameraUniforms>.stride)
         
-        let (posRead, posWrite) = currentBuffer == 0
+        let (posRead, posWrite) = currentPhysicsBuffer == 0
             ? (positionsBufferA!, positionsBufferB!)
             : (positionsBufferB!, positionsBufferA!)
-        let (velRead, velWrite) = currentBuffer == 0
+        let (velRead, velWrite) = currentPhysicsBuffer == 0
             ? (velocitiesBufferA!, velocitiesBufferB!)
             : (velocitiesBufferB!, velocitiesBufferA!)
 
-        self.cmdAllocator.reset()
-        self.cmdBuffer.beginCommandBuffer(allocator: self.cmdAllocator)
+        currAllocator.reset()
+        currCmdBuffer.beginCommandBuffer(allocator: currAllocator)
         
         // compute
-        let computeEncoder = self.cmdBuffer.makeComputeCommandEncoder()!
-        computeEncoder.setComputePipelineState(self.computePipeline)
+        let computeEncoder = currCmdBuffer.makeComputeCommandEncoder()!
+        computeEncoder.setComputePipelineState(self.computePipelineState)
         
         argumentTable.setAddress(posRead.gpuAddress, index: 0)
         argumentTable.setAddress(velRead.gpuAddress, index: 1)
@@ -287,7 +275,8 @@ class Renderer: NSObject, MTKViewDelegate {
         argumentTable.setAddress(posWrite.gpuAddress, index: 3)
         argumentTable.setAddress(velWrite.gpuAddress, index: 4)
         argumentTable.setAddress(nBodyUniformsBuffer.gpuAddress, index: 5)
-        argumentTable.setAddress(cameraUniformsBuffer.gpuAddress, index: 6)
+        argumentTable.setAddress(currCamBuffer.gpuAddress, index: 6)
+        
         computeEncoder.setArgumentTable(self.argumentTable)
         
         let threadsPerGrid = MTLSize(width: particleCount, height: 1, depth: 1)
@@ -299,13 +288,7 @@ class Renderer: NSObject, MTKViewDelegate {
         computeEncoder.endEncoding()
         
         // render
-        let trailPassDesc = MTL4RenderPassDescriptor()
-        trailPassDesc.colorAttachments[0].texture = trailTexture
-        trailPassDesc.colorAttachments[0].loadAction = frameNumber == 0 ? .clear : .load
-        trailPassDesc.colorAttachments[0].storeAction = .store
-        trailPassDesc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        
-        let renderPassEncoder = self.cmdBuffer.makeRenderCommandEncoder(descriptor: trailPassDesc)!
+        let renderPassEncoder = currCmdBuffer.makeRenderCommandEncoder(descriptor: rpDesc)!
         
         var vp = MTLViewport()
         vp.originX = 0
@@ -316,9 +299,6 @@ class Renderer: NSObject, MTKViewDelegate {
         vp.zfar = 1
         renderPassEncoder.setViewport(vp)
         
-        renderPassEncoder.setRenderPipelineState(self.fadePipeline)
-        renderPassEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
-
         renderPassEncoder.setArgumentTable(self.argumentTable, stages: .vertex)
         renderPassEncoder.setRenderPipelineState(self.renderPipelineState)
 
@@ -326,23 +306,14 @@ class Renderer: NSObject, MTKViewDelegate {
             .drawPrimitives(primitiveType: .point, vertexStart: 0, vertexCount: particleCount)
         renderPassEncoder.endEncoding()
         
-        let copyPassDesc = view.currentMTL4RenderPassDescriptor!
-        copyPassDesc.colorAttachments[0].loadAction = .dontCare
-        
-        let copyEncoder = cmdBuffer.makeRenderCommandEncoder(descriptor: copyPassDesc)!
-        copyEncoder.setRenderPipelineState(self.copyPipeline)
-        argumentTable.setTexture(trailTexture.gpuResourceID, index: 0)
-        copyEncoder.setArgumentTable(self.argumentTable, stages: .fragment)
-        copyEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 3)
-        copyEncoder.endEncoding()
-        
-        self.cmdBuffer.endCommandBuffer()
+        currCmdBuffer.endCommandBuffer()
         self.cmdQ.waitForDrawable(drawable)
-        self.cmdQ.commit([self.cmdBuffer])
+        self.cmdQ.commit([currCmdBuffer])
+        self.cmdQ.signalEvent(self.sharedEvent, value: frameNumber)
         self.cmdQ.signalDrawable(drawable)
-        drawable.present()
         
-        currentBuffer = 1 - currentBuffer
+        drawable.present()
         frameNumber += 1
+        currentPhysicsBuffer = 1 - currentPhysicsBuffer
     }
 }
